@@ -1,0 +1,13 @@
+{
+	"admin/services/lan-scanner": {
+		"title": "局域网设备扫描",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "lan-scanner"
+		},
+		"depends": {
+			"acl": [ "luci-app-lan-scanner" ]
+		}
+	}
+}

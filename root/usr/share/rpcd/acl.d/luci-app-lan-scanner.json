@@ -1,0 +1,15 @@
+{
+	"luci-app-lan-scanner": {
+		"description": "Grant access to LAN Device Scanner",
+		"read": {
+			"file": {
+				"/usr/libexec/lan-scanner": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/lan-scanner": [ "exec" ]
+			}
+		}
+	}
+}
