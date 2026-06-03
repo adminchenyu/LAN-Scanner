@@ -1,0 +1,732 @@
+#!/bin/sh
+#
+# LAN Device Scanner backend for LuCI.
+# Public interface:
+#   lan-scanner start <CIDR>
+#   lan-scanner status <JOB_ID>
+#   lan-scanner stop <JOB_ID>
+#   lan-scanner default-cidr
+#   lan-scanner history
+#   lan-scanner cleanup
+
+set -u
+
+RUNDIR="/tmp/lan-scanner"
+JOBDIR="$RUNDIR/jobs"
+HISTORY="$RUNDIR/history.tsv"
+VENDOR_CACHE="$RUNDIR/mac-vendors.tsv"
+VENDOR_UPDATER="/usr/libexec/lan-scanner-update-mac-vendors.sh"
+MAX_HOSTS=16777214
+DEFAULT_CONCURRENCY=32
+MAX_CONCURRENCY=128
+
+mkdir -p "$JOBDIR"
+
+json_escape() {
+	printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/ /g; s/\r//g; s/\n/ /g'
+}
+
+json_string() {
+	printf '"%s"' "$(json_escape "${1:-}")"
+}
+
+now_epoch() {
+	date '+%s'
+}
+
+now_iso() {
+	date '+%Y-%m-%d %H:%M:%S'
+}
+
+fail_json() {
+	printf '{"ok":false,"error":'
+	json_string "$1"
+	printf '}\n'
+	exit 1
+}
+
+valid_cidr() {
+	cidr="${1:-}"
+
+	case "$cidr" in
+		*[!0-9./]* | */*/* | .* | *..* | *.) return 1 ;;
+	esac
+
+	ip="${cidr%/*}"
+	prefix="${cidr#*/}"
+	[ "$ip" != "$cidr" ] || return 1
+	[ -n "$ip" ] && [ -n "$prefix" ] || return 1
+
+	case "$prefix" in
+		'' | *[!0-9]* ) return 1 ;;
+	esac
+	[ "$prefix" -ge 8 ] 2>/dev/null || return 1
+	[ "$prefix" -le 30 ] 2>/dev/null || return 1
+
+	awk -v ip="$ip" '
+		BEGIN {
+			n = split(ip, a, ".")
+			if (n != 4) exit 1
+			for (i = 1; i <= 4; i++) {
+				if (a[i] !~ /^[0-9]+$/ || a[i] < 0 || a[i] > 255) exit 1
+			}
+			exit 0
+		}
+	'
+}
+
+host_count() {
+	cidr="$1"
+	prefix="${cidr#*/}"
+	awk -v p="$prefix" 'BEGIN { printf "%d\n", (2 ^ (32 - p)) - 2 }'
+}
+
+valid_concurrency() {
+	value="${1:-}"
+
+	case "$value" in
+		'' | *[!0-9]* ) return 1 ;;
+	esac
+	[ "$value" -ge 1 ] 2>/dev/null || return 1
+	[ "$value" -le "$MAX_CONCURRENCY" ] 2>/dev/null || return 1
+}
+
+cidr_hosts() {
+	cidr="$1"
+	awk -v cidr="$cidr" '
+		function ip2num(a) {
+			return (a[1] * 16777216) + (a[2] * 65536) + (a[3] * 256) + a[4]
+		}
+		function num2ip(n, a, b, c, d) {
+			a = int(n / 16777216); n -= a * 16777216
+			b = int(n / 65536); n -= b * 65536
+			c = int(n / 256); d = n - c * 256
+			return a "." b "." c "." d
+		}
+		BEGIN {
+			split(cidr, parts, "/")
+			split(parts[1], octets, ".")
+			prefix = parts[2] + 0
+			size = 2 ^ (32 - prefix)
+			base = int(ip2num(octets) / size) * size
+			first = base + 1
+			last = base + size - 2
+			for (n = first; n <= last; n++) print num2ip(n)
+		}
+	'
+}
+
+ubus_hint_mac() {
+	ip="$1"
+	command -v ubus >/dev/null 2>&1 || return 0
+
+	ubus call luci-rpc getHostHints 2>/dev/null | tr -d '\n\r\t ' | awk -v ip="$ip" '
+		{
+			n = split($0, rows, "},")
+			for (i = 1; i <= n; i++) {
+				if (index(rows[i], "\"" ip "\"")) {
+					if (match(rows[i], /"[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]"/)) {
+						v = substr(rows[i], RSTART + 1, RLENGTH - 2)
+						print v
+						exit
+					}
+				}
+			}
+		}
+	' | awk 'NF { print; exit }'
+}
+
+arp_mac() {
+	ip="$1"
+
+	if command -v ip >/dev/null 2>&1; then
+		ip neigh show "$ip" 2>/dev/null | awk '
+			{
+				for (i = 1; i <= NF; i++) {
+					if ($i == "lladdr" && (i + 1) <= NF) {
+						print $(i + 1)
+						exit
+					}
+				}
+			}
+		'
+	fi
+
+	awk -v ip="$ip" '$1 == ip && $4 != "00:00:00:00:00:00" { print $4; exit }' /proc/net/arp 2>/dev/null
+}
+
+history_mac() {
+	ip="$1"
+	[ -r "$HISTORY" ] || return 0
+	awk -F '	' -v ip="$ip" '$1 == ip { print $2; exit }' "$HISTORY"
+}
+
+history_seen() {
+	ip="$1"
+	[ -r "$HISTORY" ] || return 0
+	awk -F '	' -v ip="$ip" '$1 == ip { print $3; exit }' "$HISTORY"
+}
+
+history_upsert() {
+	ip="$1"
+	mac="$2"
+	seen="$3"
+
+	[ -n "$mac" ] || return 0
+	if [ ! -r "$HISTORY" ]; then
+		printf '%s	%s	%s\n' "$ip" "$mac" "$seen" > "$HISTORY"
+		return 0
+	fi
+
+	tmp="$HISTORY.$$"
+	awk -F '	' -v OFS='	' -v ip="$ip" -v mac="$mac" -v seen="$seen" '
+		BEGIN { done = 0 }
+		$1 == ip {
+			print ip, mac, seen
+			done = 1
+			next
+		}
+		{ print $1, $2, $3 }
+		END {
+			if (!done) print ip, mac, seen
+		}
+	' "$HISTORY" 2>/dev/null > "$tmp"
+	mv "$tmp" "$HISTORY"
+}
+
+mac_hex() {
+	printf '%s' "${1:-}" | awk '{
+		v = toupper($0)
+		gsub(/[:.-]/, "", v)
+		print v
+	}'
+}
+
+mac_vendor_lookup() {
+	mac="${1:-}"
+	lookup_cache="${2:-}"
+
+	[ -n "$mac" ] || {
+		printf '%s\n' "-"
+		return 0
+	}
+
+	hex="$(mac_hex "$mac")"
+	case "$hex" in
+		'' | *[!0-9A-F]* )
+			printf '%s\n' "-"
+			return 0
+			;;
+	esac
+
+	if [ -r "$lookup_cache" ]; then
+		cached="$(awk -F '	' -v hex="$hex" '$1 == hex { print $2; exit }' "$lookup_cache" 2>/dev/null)"
+		if [ -n "$cached" ]; then
+			printf '%s\n' "$cached"
+			return 0
+		fi
+	fi
+
+	if [ ! -s "$VENDOR_CACHE" ]; then
+		vendor="Unknown"
+	else
+		p36="$(printf '%s' "$hex" | cut -c 1-9)"
+		p28="$(printf '%s' "$hex" | cut -c 1-7)"
+		p24="$(printf '%s' "$hex" | cut -c 1-6)"
+		vendor="$(awk -F '	' -v p36="$p36" -v p28="$p28" -v p24="$p24" '
+			$2 == 36 && $1 == p36 { print $3; found = 1; exit }
+			$2 == 28 && $1 == p28 { v28 = $3 }
+			$2 == 24 && $1 == p24 { v24 = $3 }
+			END {
+				if (!found) {
+					if (v28) print v28
+					else if (v24) print v24
+				}
+			}
+		' "$VENDOR_CACHE" 2>/dev/null)"
+		[ -n "$vendor" ] || vendor="Unknown"
+	fi
+
+	[ -n "$lookup_cache" ] && printf '%s	%s\n' "$hex" "$vendor" >> "$lookup_cache" 2>/dev/null
+	printf '%s\n' "$vendor"
+}
+
+ping_host() {
+	ip="$1"
+	ping -c 2 -W 2 "$ip" 2>/dev/null
+}
+
+latency_from_ping() {
+	awk -F 'time=' '/time=/ { split($2, a, " "); print a[1]; exit }'
+}
+
+scan_one_host() {
+	ip="$1"
+	vendor_lookup_cache="$2"
+	last_scan="$(now_iso)"
+	prev_mac="$(history_mac "$ip")"
+	prev_seen="$(history_seen "$ip")"
+	mac=""
+	mac_vendor="-"
+	latency=""
+
+	if ping_output="$(ping_host "$ip")"; then
+		status="online"
+		latency="$(printf '%s\n' "$ping_output" | latency_from_ping)"
+		mac="$(arp_mac "$ip" | awk 'NF { print; exit }')"
+		[ -n "$mac" ] || mac="$(ubus_hint_mac "$ip")"
+		[ -n "$mac" ] || mac="$prev_mac"
+		mac_vendor="$(mac_vendor_lookup "$mac" "$vendor_lookup_cache")"
+		note="在线，ICMP ping 有响应。"
+	else
+		[ -n "$prev_mac" ] && mac="$prev_mac"
+		if [ -n "$mac" ]; then
+			status="known_offline"
+			mac_vendor="$(mac_vendor_lookup "$mac" "$vendor_lookup_cache")"
+			note="离线：本次 ping 未响应。"
+		else
+			status="unresponsive"
+			note="ping 未响应；可能未使用、设备关机或防火墙拦截 ICMP。"
+		fi
+		[ -n "$prev_seen" ] && [ -z "$mac" ] && note="$note 上次发现时间：$prev_seen。"
+	fi
+
+	case "$status" in
+		unresponsive) mac_vendor="-" ;;
+	esac
+
+	[ -n "$latency" ] || latency="-"
+	[ -n "$mac" ] || mac="-"
+	[ -n "$mac_vendor" ] || mac_vendor="-"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ip" "$status" "$latency" "$mac" "$mac_vendor" "$last_scan" "$note"
+}
+
+write_job() {
+	job_file="$1"
+	state="$2"
+	cidr="$3"
+	started="$4"
+	total="$5"
+	scanned="$6"
+	online="$7"
+	unresponsive="$8"
+	known_offline="$9"
+	results_file="${10}"
+
+	now="$(now_epoch)"
+	duration=$((now - started))
+	tmp="$job_file.$$"
+
+	{
+		printf '{'
+		printf '"ok":true,'
+		printf '"job_id":'; json_string "$(basename "$job_file" .json)"; printf ','
+		printf '"state":'; json_string "$state"; printf ','
+		case "$state" in
+			queued | running) is_running=true ;;
+			*) is_running=false ;;
+		esac
+		printf '"running":%s,' "$is_running"
+		printf '"cidr":'; json_string "$cidr"; printf ','
+		printf '"total":%s,' "$total"
+		printf '"scanned":%s,' "$scanned"
+		printf '"online":%s,' "$online"
+		printf '"unresponsive":%s,' "$unresponsive"
+		printf '"known_offline":%s,' "$known_offline"
+		printf '"started_at":%s,' "$started"
+		printf '"updated_at":%s,' "$now"
+		printf '"duration":%s,' "$duration"
+		printf '"results":['
+		if [ -s "$results_file" ]; then
+			sed '$ s/,$//' "$results_file"
+		fi
+		printf ']}'
+		printf '\n'
+	} > "$tmp"
+
+	mv "$tmp" "$job_file"
+}
+
+append_result() {
+	results_file="$1"
+	ip="$2"
+	status="$3"
+	latency="$4"
+	mac="$5"
+	mac_vendor="$6"
+	last_scan="$7"
+	note="$8"
+
+	{
+		printf '{'
+		printf '"ip":'; json_string "$ip"; printf ','
+		printf '"status":'; json_string "$status"; printf ','
+		printf '"latency":'; json_string "$latency"; printf ','
+		printf '"mac":'; json_string "$mac"; printf ','
+		printf '"mac_vendor":'; json_string "$mac_vendor"; printf ','
+		printf '"last_scan":'; json_string "$last_scan"; printf ','
+		printf '"note":'; json_string "$note"
+		printf '},'
+		printf '\n'
+	} >> "$results_file"
+}
+
+process_scan_result() {
+	result_file="$1"
+	[ -s "$result_file" ] || return 0
+
+	IFS='	' read -r ip status latency mac mac_vendor last_scan note < "$result_file" || return 0
+
+	case "$status" in
+		online)
+			online=$((online + 1))
+			history_upsert "$ip" "$mac" "$last_scan"
+			;;
+		known_offline)
+			known_offline=$((known_offline + 1))
+			;;
+		*)
+			unresponsive=$((unresponsive + 1))
+			;;
+	esac
+
+	scanned=$((scanned + 1))
+	append_result "$results_file" "$ip" "$status" "$latency" "$mac" "$mac_vendor" "$last_scan" "$note"
+}
+
+run_scan() {
+	job="$1"
+	cidr="$2"
+	job_file="$JOBDIR/$job.json"
+	results_file="$JOBDIR/$job.results"
+	vendor_lookup_cache="$JOBDIR/$job.vendors"
+	hosts_fifo="$JOBDIR/$job.hosts.fifo"
+	stop_file="$JOBDIR/$job.stop"
+	started="$(now_epoch)"
+	total="$(host_count "$cidr")"
+
+	: > "$results_file"
+	: > "$vendor_lookup_cache"
+	write_job "$job_file" "running" "$cidr" "$started" "$total" 0 0 0 0 "$results_file"
+
+	if [ -x "$VENDOR_UPDATER" ]; then
+		"$VENDOR_UPDATER" >/dev/null 2>&1 || true
+	fi
+
+	rm -f "$hosts_fifo"
+	mkfifo "$hosts_fifo" 2>/dev/null || {
+		write_job "$job_file" "error" "$cidr" "$started" "$total" 0 0 0 0 "$results_file"
+		rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+		return 1
+	}
+	cidr_hosts "$cidr" > "$hosts_fifo" &
+	generator_pid="$!"
+
+	scanned=0
+	online=0
+	unresponsive=0
+	known_offline=0
+	stopped=0
+
+	while IFS= read -r ip; do
+		if [ -e "$stop_file" ]; then
+			write_job "$job_file" "stopped" "$cidr" "$started" "$total" "$scanned" "$online" "$unresponsive" "$known_offline" "$results_file"
+			kill "$generator_pid" 2>/dev/null
+			stopped=1
+			rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+			return 0
+		fi
+
+		scanned=$((scanned + 1))
+		last_scan="$(now_iso)"
+		prev_mac="$(history_mac "$ip")"
+		prev_seen="$(history_seen "$ip")"
+		mac=""
+		mac_vendor="-"
+		latency=""
+
+		if ping_output="$(ping_host "$ip")"; then
+			status="online"
+			latency="$(printf '%s\n' "$ping_output" | latency_from_ping)"
+			mac="$(arp_mac "$ip" | awk 'NF { print; exit }')"
+			[ -n "$mac" ] || mac="$(ubus_hint_mac "$ip")"
+			[ -n "$mac" ] || mac="$prev_mac"
+			mac_vendor="$(mac_vendor_lookup "$mac" "$vendor_lookup_cache")"
+			note="在线，ICMP ping 有响应。"
+			online=$((online + 1))
+			history_upsert "$ip" "$mac" "$last_scan"
+		else
+			[ -n "$prev_mac" ] && mac="$prev_mac"
+			if [ -n "$mac" ]; then
+				status="known_offline"
+				mac_vendor="$(mac_vendor_lookup "$mac" "$vendor_lookup_cache")"
+				note="离线：本次 ping 未响应。"
+				known_offline=$((known_offline + 1))
+			else
+				status="unresponsive"
+				note="ping 未响应；可能未使用、设备关机或防火墙拦截 ICMP。"
+				unresponsive=$((unresponsive + 1))
+			fi
+			[ -n "$prev_seen" ] && [ -z "$mac" ] && note="$note 上次发现时间：$prev_seen。"
+		fi
+
+		case "$status" in
+			unresponsive) mac_vendor="-" ;;
+		esac
+		append_result "$results_file" "$ip" "$status" "$latency" "$mac" "$mac_vendor" "$last_scan" "$note"
+		write_job "$job_file" "running" "$cidr" "$started" "$total" "$scanned" "$online" "$unresponsive" "$known_offline" "$results_file"
+	done < "$hosts_fifo"
+
+	if [ -e "$stop_file" ] || [ "$stopped" -eq 1 ]; then
+		write_job "$job_file" "stopped" "$cidr" "$started" "$total" "$scanned" "$online" "$unresponsive" "$known_offline" "$results_file"
+	else
+		write_job "$job_file" "done" "$cidr" "$started" "$total" "$total" "$online" "$unresponsive" "$known_offline" "$results_file"
+	fi
+	rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+}
+
+run_scan_parallel() {
+	job="$1"
+	cidr="$2"
+	concurrency="$3"
+	job_file="$JOBDIR/$job.json"
+	results_file="$JOBDIR/$job.results"
+	vendor_lookup_cache="$JOBDIR/$job.vendors"
+	result_dir="$JOBDIR/$job.parts"
+	hosts_fifo="$JOBDIR/$job.hosts.fifo"
+	stop_file="$JOBDIR/$job.stop"
+	started="$(now_epoch)"
+	total="$(host_count "$cidr")"
+
+	valid_concurrency "$concurrency" || concurrency="$DEFAULT_CONCURRENCY"
+
+	: > "$results_file"
+	: > "$vendor_lookup_cache"
+	rm -rf "$result_dir"
+	mkdir -p "$result_dir" 2>/dev/null || {
+		write_job "$job_file" "error" "$cidr" "$started" "$total" 0 0 0 0 "$results_file"
+		rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+		return 1
+	}
+	write_job "$job_file" "running" "$cidr" "$started" "$total" 0 0 0 0 "$results_file"
+
+	if [ -x "$VENDOR_UPDATER" ]; then
+		"$VENDOR_UPDATER" >/dev/null 2>&1 || true
+	fi
+
+	rm -f "$hosts_fifo"
+	mkfifo "$hosts_fifo" 2>/dev/null || {
+		write_job "$job_file" "error" "$cidr" "$started" "$total" 0 0 0 0 "$results_file"
+		rm -rf "$result_dir"
+		rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+		return 1
+	}
+	cidr_hosts "$cidr" > "$hosts_fifo" &
+	generator_pid="$!"
+
+	scanned=0
+	online=0
+	unresponsive=0
+	known_offline=0
+	stopped=0
+	seq=0
+	batch_start=1
+	active=0
+	pids=""
+
+	wait_batch() {
+		for pid in $pids; do
+			wait "$pid" 2>/dev/null || true
+		done
+
+		i="$batch_start"
+		while [ "$i" -le "$seq" ]; do
+			process_scan_result "$result_dir/$i.tsv"
+			i=$((i + 1))
+		done
+
+		write_job "$job_file" "running" "$cidr" "$started" "$total" "$scanned" "$online" "$unresponsive" "$known_offline" "$results_file"
+		rm -f "$result_dir"/*.tsv 2>/dev/null
+		batch_start=$((seq + 1))
+		active=0
+		pids=""
+	}
+
+	while IFS= read -r ip; do
+		if [ -e "$stop_file" ]; then
+			for pid in $pids; do
+				kill "$pid" 2>/dev/null || true
+			done
+			write_job "$job_file" "stopped" "$cidr" "$started" "$total" "$scanned" "$online" "$unresponsive" "$known_offline" "$results_file"
+			kill "$generator_pid" 2>/dev/null
+			stopped=1
+			rm -rf "$result_dir"
+			rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+			return 0
+		fi
+
+		seq=$((seq + 1))
+		scan_one_host "$ip" "$vendor_lookup_cache" > "$result_dir/$seq.tsv" 2>/dev/null &
+		pids="$pids $!"
+		active=$((active + 1))
+
+		if [ "$active" -ge "$concurrency" ]; then
+			wait_batch
+		fi
+	done < "$hosts_fifo"
+
+	if [ "$active" -gt 0 ]; then
+		wait_batch
+	fi
+
+	if [ -e "$stop_file" ] || [ "$stopped" -eq 1 ]; then
+		write_job "$job_file" "stopped" "$cidr" "$started" "$total" "$scanned" "$online" "$unresponsive" "$known_offline" "$results_file"
+	else
+		write_job "$job_file" "done" "$cidr" "$started" "$total" "$total" "$online" "$unresponsive" "$known_offline" "$results_file"
+	fi
+	rm -rf "$result_dir"
+	rm -f "$results_file" "$vendor_lookup_cache" "$hosts_fifo" "$stop_file"
+}
+
+start_scan() {
+	cidr="${1:-}"
+	concurrency="${2:-$DEFAULT_CONCURRENCY}"
+	valid_cidr "$cidr" || fail_json "CIDR 格式无效。请输入 192.168.0.0/24 这类 IPv4 网段，前缀范围为 /8 到 /30。"
+	valid_concurrency "$concurrency" || fail_json "并发数无效。请输入 1 到 128 之间的整数，建议使用 1、16、32、64 或 128。"
+
+	total="$(host_count "$cidr")"
+	[ "$total" -gt 0 ] 2>/dev/null || fail_json "CIDR 中没有可扫描主机。"
+	[ "$total" -le "$MAX_HOSTS" ] 2>/dev/null || fail_json "为避免长时间扫描，最多支持 $MAX_HOSTS 个主机地址。建议使用 /24、/25、/26 等网段。"
+
+	job="$(date '+%Y%m%d%H%M%S')-$$"
+	job_file="$JOBDIR/$job.json"
+	started="$(now_epoch)"
+	empty="$JOBDIR/$job.empty"
+	: > "$empty"
+	write_job "$job_file" "queued" "$cidr" "$started" "$total" 0 0 0 0 "$empty"
+	rm -f "$empty" "$JOBDIR/$job.stop"
+
+	/bin/sh "$0" run "$job" "$cidr" "$concurrency" >/dev/null 2>&1 &
+
+	printf '{"ok":true,"job_id":'
+	json_string "$job"
+	printf ',"total":%s,"concurrency":%s}\n' "$total" "$concurrency"
+}
+
+default_cidr() {
+	ip=""
+
+	if command -v ubus >/dev/null 2>&1; then
+		ip="$(ubus call network.interface.lan status 2>/dev/null | awk '
+			/"address":/ {
+				v = $2
+				gsub(/[",]/, "", v)
+				if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+					print v
+					exit
+				}
+			}
+		')"
+	fi
+
+	if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+		ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '
+			{
+				for (i = 1; i <= NF; i++) {
+					if ($i == "src" && (i + 1) <= NF) {
+						print $(i + 1)
+						exit
+					}
+				}
+			}
+		')"
+	fi
+
+	case "$ip" in
+		[0-9]*.[0-9]*.[0-9]*.[0-9]*)
+			cidr="$(printf '%s\n' "$ip" | awk -F . '{ print $1 "." $2 "." $3 ".0/24" }')"
+			;;
+		*)
+			cidr="192.168.0.0/24"
+			;;
+	esac
+
+	printf '{"ok":true,"cidr":'
+	json_string "$cidr"
+	printf '}\n'
+}
+
+status_job() {
+	job="${1:-}"
+	case "$job" in
+		'' | *[!A-Za-z0-9._-]* ) fail_json "JOB_ID 无效。" ;;
+	esac
+
+	job_file="$JOBDIR/$job.json"
+	[ -r "$job_file" ] || fail_json "找不到扫描任务。"
+	cat "$job_file"
+}
+
+stop_job() {
+	job="${1:-}"
+	case "$job" in
+		'' | *[!A-Za-z0-9._-]* ) fail_json "JOB_ID 无效。" ;;
+	esac
+
+	job_file="$JOBDIR/$job.json"
+	[ -r "$job_file" ] || fail_json "找不到扫描任务。"
+	: > "$JOBDIR/$job.stop"
+	printf '{"ok":true,"job_id":'
+	json_string "$job"
+	printf ',"state":"stopping"}\n'
+}
+
+show_history() {
+	printf '{"ok":true,"items":['
+	if [ -r "$HISTORY" ]; then
+		awk -F '	' '
+			function esc(s) {
+				gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); gsub(/\r/,"",s); gsub(/\n/," ",s); return s
+			}
+			{
+				if (n++) printf ","
+				printf "{\"ip\":\"%s\",\"mac\":\"%s\",\"last_seen\":\"%s\"}", esc($1), esc($2), esc($3)
+			}
+		' "$HISTORY"
+	fi
+	printf ']}\n'
+}
+
+cleanup_jobs() {
+	find "$JOBDIR" -type f -mtime +1 -name '*.json' -exec rm -f {} \; 2>/dev/null
+	printf '{"ok":true}\n'
+}
+
+case "${1:-}" in
+	start)
+		start_scan "${2:-}" "${3:-$DEFAULT_CONCURRENCY}"
+		;;
+	status)
+		status_job "${2:-}"
+		;;
+	stop)
+		stop_job "${2:-}"
+		;;
+	default-cidr)
+		default_cidr
+		;;
+	history)
+		show_history
+		;;
+	cleanup)
+		cleanup_jobs
+		;;
+	run)
+		case "${2:-}" in '' | *[!A-Za-z0-9._-]* ) exit 1 ;; esac
+		valid_cidr "${3:-}" || exit 1
+		run_scan_parallel "$2" "$3" "${4:-$DEFAULT_CONCURRENCY}"
+		;;
+	*)
+		fail_json "用法：lan-scanner start <CIDR> | status <JOB_ID> | stop <JOB_ID> | default-cidr | history | cleanup"
+		;;
+esac

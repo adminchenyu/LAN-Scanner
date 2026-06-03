@@ -1,0 +1,10 @@
+{
+	"admin/services/lan-scanner": {
+		"title": "\u5c40\u57df\u7f51\u8bbe\u5907\u626b\u63cf",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "lan-scanner"
+		}
+	}
+}

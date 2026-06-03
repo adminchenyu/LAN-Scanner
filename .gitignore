@@ -1,0 +1,22 @@
+.DS_Store
+Thumbs.db
+
+# OpenWrt build artifacts
+/bin/
+/build_dir/
+/dl/
+/feeds/
+/logs/
+/package/feeds/
+/staging_dir/
+/tmp/
+*.ipk
+*.tar.gz
+*.tar.xz
+
+# Editor and local files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

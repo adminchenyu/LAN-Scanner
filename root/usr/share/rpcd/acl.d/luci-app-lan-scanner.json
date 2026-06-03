@@ -1,0 +1,17 @@
+{
+	"luci-app-lan-scanner": {
+		"description": "Grant access to LAN Device Scanner",
+		"read": {
+			"file": {
+				"/usr/libexec/lan-scanner": [ "exec" ],
+				"/usr/libexec/lan-scanner-update-mac-vendors.sh": [ "exec" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/lan-scanner": [ "exec" ],
+				"/usr/libexec/lan-scanner-update-mac-vendors.sh": [ "exec" ]
+			}
+		}
+	}
+}
